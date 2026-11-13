@@ -116,6 +116,22 @@ public class ValidatorAccessTokenValidator implements AccessTokenValidator {
         VerificationKeyResolver verificationKeyResolver,
         String scopeClaimName,
         String subClaimName) {
+        this(clockSkew, expectedAudiences, expectedIssuer, verificationKeyResolver, scopeClaimName,
+            subClaimName, false);
+    }
+
+    /**
+     * As above; with {@code skipDefaultAudienceValidation} set (only when the audience opt-out
+     * {@code sasl.oauthbearer.allow.unverified.audience} is enabled and no expected audience is configured),
+     * jose4j's default audience validation is skipped so a JWT bearing any (or no) "aud" claim is accepted.
+     */
+    public ValidatorAccessTokenValidator(Integer clockSkew,
+        Set<String> expectedAudiences,
+        String expectedIssuer,
+        VerificationKeyResolver verificationKeyResolver,
+        String scopeClaimName,
+        String subClaimName,
+        boolean skipDefaultAudienceValidation) {
         final JwtConsumerBuilder jwtConsumerBuilder = new JwtConsumerBuilder();
 
         if (clockSkew != null)
@@ -123,6 +139,8 @@ public class ValidatorAccessTokenValidator implements AccessTokenValidator {
 
         if (expectedAudiences != null && !expectedAudiences.isEmpty())
             jwtConsumerBuilder.setExpectedAudience(expectedAudiences.toArray(new String[0]));
+        else if (skipDefaultAudienceValidation)
+            jwtConsumerBuilder.setSkipDefaultAudienceValidation();
 
         if (expectedIssuer != null)
             jwtConsumerBuilder.setExpectedIssuer(expectedIssuer);
