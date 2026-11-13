@@ -21,15 +21,20 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 import org.apache.kafka.common.config.ConfigException;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedConstruction;
+import org.mockito.MockedStatic;
 
 import static java.util.Arrays.asList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.when;
 
 public class ClientUtilsTest {
 
@@ -55,15 +60,39 @@ public class ClientUtilsTest {
         checkWithoutLookup("[::1]:8000");
         checkWithoutLookup("[2001:db8:85a3:8d3:1319:8a2e:370:7348]:1234", "localhost:10000");
 
-        // With lookup of example.com, either one or two addresses are expected depending on
-        // whether ipv4 and ipv6 are enabled
-        List<InetSocketAddress> validatedAddresses = checkWithLookup(asList("example.com:10000"));
-        assertTrue(validatedAddresses.size() >= 1, "Unexpected addresses " + validatedAddresses);
-        List<String> validatedHostNames = validatedAddresses.stream().map(InetSocketAddress::getHostName)
-                .collect(Collectors.toList());
-        List<String> expectedHostNames = asList("93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c");
-        assertTrue(expectedHostNames.containsAll(validatedHostNames), "Unexpected addresses " + validatedHostNames);
-        validatedAddresses.forEach(address -> assertEquals(10000, address.getPort()));
+        String hostname = "example.com";
+        Integer port = 10000;
+        String canonicalHostname1 = "canonical_hostname1";
+        String canonicalHostname2 = "canonical_hostname2";
+        try (final MockedStatic<InetAddress> inetAddress = mockStatic(InetAddress.class)) {
+            InetAddress inetAddress1 = mock(InetAddress.class);
+            when(inetAddress1.getCanonicalHostName()).thenReturn(canonicalHostname1);
+            InetAddress inetAddress2 = mock(InetAddress.class);
+            when(inetAddress2.getCanonicalHostName()).thenReturn(canonicalHostname2);
+            inetAddress.when(() -> InetAddress.getAllByName(hostname))
+                .thenReturn(new InetAddress[]{inetAddress1, inetAddress2});
+            try (MockedConstruction<InetSocketAddress> inetSocketAddress =
+                     mockConstruction(
+                         InetSocketAddress.class,
+                         (mock, context) -> {
+                             when(mock.isUnresolved()).thenReturn(false);
+                             when(mock.getHostName()).thenReturn((String) context.arguments().get(0));
+                             when(mock.getPort()).thenReturn((Integer) context.arguments().get(1));
+                         })
+            ) {
+                List<InetSocketAddress> validatedAddresses = checkWithLookup(Collections.singletonList(hostname + ":" + port));
+                assertEquals(2, inetSocketAddress.constructed().size());
+                assertEquals(2, validatedAddresses.size());
+                assertTrue(validatedAddresses.containsAll(asList(
+                    inetSocketAddress.constructed().get(0),
+                    inetSocketAddress.constructed().get(1)))
+                );
+                validatedAddresses.forEach(address -> assertEquals(port, address.getPort()));
+                validatedAddresses.stream().map(InetSocketAddress::getHostName).forEach(
+                    hostName -> assertTrue(asList(canonicalHostname1, canonicalHostname2).contains(hostName))
+                );
+            }
+        }
     }
 
     @Test

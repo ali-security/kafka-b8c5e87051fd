@@ -1,0 +1,177 @@
+name: CI
+
+# Authored for the sealed build: upstream Kafka 3.7.1 has no GitHub Actions workflow
+# that builds or tests kafka-clients (its CI is the Jenkinsfile). This mirrors the
+# Jenkinsfile's test stages (JDK 8/11/17/21, maxParallelForks=2, maxTestRetries=1,
+# maxTestRetryFailures=10) for the :clients module, and builds the release jars on
+# JDK 8 (the toolchain release.py uses) with the release commit id.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task + selector (e.g. ":clients:test --tests FooTest"); empty runs the full :clients suite'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test kafka-clients (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["8", "11", "17", "21"]
+    env:
+      # kafka-version.properties in the public jar carries commitId=e2494e6ffb89f828
+      # (the 3.7.1 release commit); the fork's HEAD is a different commit.
+      GRADLE_FLAGS: >-
+        --no-daemon --console=plain -PcommitId=e2494e6ffb89f828
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      - name: Build kafka-clients jars
+        if: matrix.java == '8'
+        run: |
+          ./gradlew :clients:jar :clients:testJar $GRADLE_FLAGS
+          ls -l clients/build/libs/
+
+      - name: Write test summary init script
+        run: |
+          cat > "$RUNNER_TEMP/test-count.gradle" <<'INIT'
+          allprojects {
+              tasks.withType(Test) {
+                  afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println("TEST SUMMARY [${project.path}]: ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped")
+                      }
+                  }
+              }
+          }
+          INIT
+
+      # The test certificates TestSslUtils generates are signed SHA1withRSA. JDK
+      # updates from April 2025 (JDK-8340321: 11.0.27, 17.0.15, 21.0.7) add
+      # rsa_pkcs1_sha1/ecdsa_sha1/dsa_sha1 "usage HandshakeSignature" to
+      # jdk.tls.disabledAlgorithms, so TLSv1.2 mutual-auth handshakes in
+      # SslTransportLayerTest fail with "Empty client certificate chain". Upstream
+      # moved TestSslUtils to SHA256withRSA later (apache/kafka 0810650da1bc), but
+      # TestSslUtils ships in kafka-clients-3.7.1-test.jar, so instead the test JVMs
+      # get the provider's own disabled list minus those SHA-1 entries (the
+      # release-era JDK default). No-op on a JDK without them (JDK 8 here).
+      - name: Restore release-era TLS 1.2 SHA-1 handshake signatures for tests
+        run: |
+          SEC="$JAVA_HOME/conf/security/java.security"
+          [ -f "$SEC" ] || SEC="$JAVA_HOME/jre/lib/security/java.security"
+          perl -0777 -ne 'if (/^jdk\.tls\.disabledAlgorithms=((?:[^\n]*\\\n)*[^\n]*)/m) { my $v = $1; $v =~ s/\\\n//g; my @e = grep { !/_sha1 usage HandshakeSignature/ } map { s/^\s+|\s+$//gr } split /,/, $v; print "jdk.tls.disabledAlgorithms=", join(", ", @e), "\n" }' "$SEC" > "$RUNNER_TEMP/tls.security"
+          echo "--- default:"; grep -A6 '^jdk.tls.disabledAlgorithms=' "$SEC"
+          echo "--- override:"; cat "$RUNNER_TEMP/tls.security"
+
+      - name: Test kafka-clients
+        run: |
+          export JAVA_TOOL_OPTIONS="-Djava.security.properties=$RUNNER_TEMP/tls.security"
+          TEST_FLAGS="$GRADLE_FLAGS -PmaxParallelForks=2 -PmaxTestRetries=1 -PmaxTestRetryFailures=10 -PtestLoggingEvents=failed,skipped -I $RUNNER_TEMP/test-count.gradle"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew ${{ inputs.test-filter }} $TEST_FLAGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          else
+            ./gradlew :generator:test :clients:test $TEST_FLAGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Report skipped tests with reasons and test totals
+        if: always()
+        run: |
+          java -version 2>&1
+          cat > "$RUNNER_TEMP/skip-reasons.pl" <<'PERL'
+          use strict; use warnings;
+          my ($srcroot, @xmls) = @ARGV;
+          my $ann = qr/^\s*(\@(?:Disabled|Enabled)\w*(?:\(.*?\))?.*)$/;
+          for my $x (@xmls) {
+            open my $fh, '<', $x or next; my $c = do { local $/; <$fh> };
+            while ($c =~ /<testcase name="([^"]*)" classname="([^"]*)"[^>]*>\s*<skipped/g) {
+              my ($name, $cls) = ($1, $2);
+              (my $meth = $name) =~ s/^(?:&quot;|")//;
+              $meth =~ s/[\(\[].*//;
+              (my $top = $cls) =~ s/\$.*//;
+              (my $simple = $cls) =~ s/.*[.\$]//;
+              my $f = "$srcroot/" . join('/', split /\./, $top) . ".java";
+              my @why;
+              if (open my $s, '<', $f) {
+                my @l = <$s>;
+                for my $i (0..$#l) {
+                  if ($l[$i] =~ /\bvoid\s+\Q$meth\E\s*\(/) {
+                    for (my $j = $i - 1; $j >= 0 && $l[$j] =~ /^\s*(\@|\/\/)/; $j--) { push @why, $1 if $l[$j] =~ $ann }
+                    if (!@why) {
+                      # aborted by an assumption in the test body (JUnit assume*)
+                      for (my $k = $i + 1; $k <= $#l && $k <= $i + 15 && $l[$k] !~ /^\s{4}\}/; $k++) {
+                        if ($l[$k] =~ /^\s*(assume\w*\(.*)$/) {
+                          my $a = "assumption not met: $1";
+                          $a .= " ($1)" if $k > 0 && $l[$k-1] =~ /^\s*\/\/\s*(.*)$/;
+                          push @why, $a;
+                        }
+                      }
+                    }
+                  }
+                }
+                if (!@why) {
+                  for my $i (0..$#l) {
+                    if ($l[$i] =~ /\bclass\s+\Q$simple\E\b/) {
+                      for (my $j = $i - 1; $j >= 0 && $l[$j] =~ /^\s*(\@|\/\/)/; $j--) { push @why, $1 if $l[$j] =~ $ann }
+                    }
+                  }
+                }
+              }
+              s/\s+$// for @why;
+              print "SKIPPED $cls.$name -- reason: ", (@why ? join(' ; ', @why) : 'no skip annotation found in source'), "\n";
+            }
+          }
+          PERL
+          echo "=== SKIPPED TESTS (class.method -- reason) ==="
+          perl "$RUNNER_TEMP/skip-reasons.pl" clients/src/test/java clients/build/test-results/test/*.xml
+          # Gradle's test-retry plugin (-PmaxTestRetries) reruns a failed test and
+          # records every attempt as its own <testcase>; the afterSuite summary counts
+          # attempts. Reconcile per unique test: the last attempt is the final result.
+          cat > "$RUNNER_TEMP/retry-report.pl" <<'PERL'
+          use strict; use warnings;
+          my (%final, %failedonce, @order);
+          for my $x (@ARGV) {
+            open my $fh, '<', $x or next; my $c = do { local $/; <$fh> };
+            while ($c =~ /<testcase name="([^"]*)" classname="([^"]*)"[^>]*?(?:\/>|>(.*?)<\/testcase>)/gs) {
+              my $k = "$2.$1"; my $b = defined $3 ? $3 : '';
+              my $st = ($b =~ /<(?:failure|error)\b/) ? 'F' : ($b =~ /<skipped\b/) ? 'S' : 'P';
+              push @order, $k unless exists $final{$k};
+              $failedonce{$k} = 1 if $st eq 'F';
+              $final{$k} = $st;
+            }
+          }
+          my ($p, $f, $s, $r) = (0, 0, 0, 0);
+          for my $k (@order) {
+            my $st = $final{$k};
+            if ($st eq 'P') { $p++; if ($failedonce{$k}) { $r++; print "RETRIED: $k -- failed, then PASSED on a Gradle test-retry rerun\n" } }
+            elsif ($st eq 'S') { $s++ }
+            else { $f++; print "FAILED ON EVERY ATTEMPT: $k\n" }
+          }
+          printf "FINAL PER-TEST RESULT [:clients]: %d unique tests, %d passed (%d of them only after a retry), %d failed, %d skipped\n", scalar(@order), $p, $r, $f, $s;
+          PERL
+          echo "=== RETRY RECONCILIATION (unique tests, last attempt wins) ==="
+          perl "$RUNNER_TEMP/retry-report.pl" clients/build/test-results/test/*.xml
+          echo "=== TEST TOTALS (Gradle afterSuite, counts every attempt incl. retries) ==="
+          grep "TEST SUMMARY" "$RUNNER_TEMP/test.log"
+
+      - name: Upload kafka-clients jars
+        if: matrix.java == '8'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-clients-jars
+          path: clients/build/libs/kafka-clients-*.jar
+          if-no-files-found: error
